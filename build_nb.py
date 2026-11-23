@@ -9,7 +9,7 @@ def code(s):
     cells.append({"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
                   "source": s.splitlines(keepends=True)})
 
-md("""# GRAI3 public demo -> soil PSD submission (multi-patch TTA)
+md("""# GRAI3 public demo -> soil PSD submission (orientation TTA)
 
 **Method.** The competition host states that GRAI3 (Soranzo, *Computers and Geotechnics* 2026) is publicly
 available and permitted. GRAI3 is a public Streamlit demo at
@@ -27,14 +27,22 @@ $$F(d) = 1 - \\exp\\left(-(d/b)^c\\right),$$
 **Two consequences that drive this notebook.**
 
 *Step 3 discards most of the photo.* The test photos are 4032x3024 (iPhone 14) and 5712x4284 (iPhone 16),
-i.e. a ~290 mm photobox field, while a 400x400 crop at 4.6 px/mm is only an **87 x 87 mm** window. So the
-demo only ever sees ~9% of each image, and one centre patch is a high-variance estimate of the bulk grading.
+i.e. a ~290 mm photobox field, while a 400x400 crop at 4.6 px/mm is only an **87 x 87 mm** window, so the
+demo only ever sees ~9% of each image.
 
-This notebook therefore evaluates every photo on a **3 x 3 grid of patches** (the centre plus eight
-translations of +-100 mm horizontally and +-65 mm vertically). Translations are applied to the JPEG in
-place with `np.roll`, keeping the pixel density and the EXIF camera tag intact, so the demo still computes
-the same ppm and every patch is individually a legitimate in-distribution 87 mm view. Patch predictions are
-averaged per photo, then across the photos of a sample.
+**A failed experiment, reported honestly.** Averaging that centre window with eight translated windows
+(+-100 mm, +-65 mm) was tried first. It made the public score clearly *worse* (13.126 vs 10.129): patches
+away from the centre are systematically biased, presumably by the photobox walls, the lighting falloff and
+the way the sample is poured, so the centre crop the demo uses is the correct one. That version is kept in
+the git history, not used here.
+
+**What this notebook does instead.** It averages over *orientation* transforms of the very same pixels: all
+eight elements of the dihedral group (identity, three rotations, four reflections). A mirror or rotation of
+a soil photo depicts exactly the same grains, so the true grading curve is unchanged by construction: any
+spread across these eight views is pure model noise, and averaging it cannot introduce the spatial bias that
+translation did. Transforms are applied to the JPEG in place, keeping the pixel density and the EXIF camera
+tag intact (the demo's ppm lookup accepts the image either way round), so every view is a legitimate
+in-distribution 87 mm crop.
 
 *The reported diameters are enough to recover the curve exactly.* Since
 
@@ -116,13 +124,13 @@ json.dump({"photos": [os.path.basename(p) for p in photos], "info": info},
 print("wrote manifest")
 """)
 
-md("""## 3. Drive the public GRAI3 demo over the patch grid
+md("""## 3. Drive the public GRAI3 demo over the orientation views
 
 Playwright's synchronous API cannot run inside Kaggle's live asyncio loop, so the browser worker is written
 to disk and executed as its own process. Streamlit's file input is hidden, so the uploader is addressed
-with `state="attached"` rather than waiting for visibility. Work is ordered **offset-major**: the centre
-patch for every photo is evaluated first, so an interrupted run still yields a complete centre-only
-submission, and each further offset adds one patch to every photo at once.
+with `state="attached"` rather than waiting for visibility. Work is ordered **transform-major**: the
+identity view of every photo is evaluated first, so an interrupted run still yields a complete
+single-view submission, and each further transform adds one view to every photo at once.
 """)
 
 code("""WORKER = r'''
@@ -142,10 +150,9 @@ names = man["photos"]
 info  = man["info"]
 raw   = json.load(open(RAW)) if os.path.exists(RAW) else {}
 
-# offsets in 4.6 px/mm screen coordinates: +-100 mm horizontal, +-65 mm vertical
-OFFSETS = [(0, 0),
-           (-420, 0), (420, 0), (0, -270), (0, 270),
-           (-420, -270), (420, -270), (-420, 270), (420, 270)]
+# all eight dihedral transforms of the identical pixel set:
+# identity, hflip, vflip, rot180, rot90, rot270, transpose, anti-transpose
+TRANSFORMS = list(range(8))
 
 SRC = "/kaggle/input/competitions/soil-grain-size-from-photos/Test_All_Photos/Test_All_Photos"
 if not os.path.isdir(SRC):
@@ -182,15 +189,26 @@ def click_confirm(page):
             pass
     return False
 
-def make_patch(name, dx, dy, dst):
-    # Translate the photo in place; pixel size, density and EXIF are preserved.
-    im  = Image.open(os.path.join(SRC, name))
-    ex  = im.info.get("exif")
-    ppm = info[name]["ppm"]
-    k   = ppm / 4.6                      # screen px -> sensor px
-    sx, sy = int(round(dx * k)), int(round(dy * k))
-    a = np.roll(np.asarray(im.convert("RGB")), shift=(sy, sx), axis=(0, 1))
-    Image.fromarray(a).save(dst, "JPEG", quality=95, exif=ex or b"")
+def make_transform(name, t, dst):
+    # Mirror/rotate in place; the pixel set is unchanged, EXIF is preserved.
+    im = Image.open(os.path.join(SRC, name))
+    ex = im.info.get("exif")
+    a = np.asarray(im.convert("RGB"))
+    if t == 1:
+        a = a[:, ::-1]                  # horizontal flip
+    elif t == 2:
+        a = a[::-1, :]                  # vertical flip
+    elif t == 3:
+        a = a[::-1, ::-1]               # 180 degree rotation
+    elif t == 4:
+        a = np.rot90(a, 1)              # 90 degree rotation (dims swap)
+    elif t == 5:
+        a = np.rot90(a, 3)              # 270 degree rotation (dims swap)
+    elif t == 6:
+        a = a.transpose(1, 0, 2)        # reflection across the main diagonal
+    elif t == 7:
+        a = a.transpose(1, 0, 2)[::-1, ::-1]   # reflection across the anti-diagonal
+    Image.fromarray(np.ascontiguousarray(a)).save(dst, "JPEG", quality=95, exif=ex or b"")
 
 def run_patch(page, path, timeout=180):
     page.goto(SPACE, wait_until="domcontentloaded", timeout=120000)
@@ -218,28 +236,28 @@ def run_patch(page, path, timeout=180):
     return best
 
 START  = time.time()
-BUDGET = 15000
+BUDGET = 13000
 
 with sync_playwright() as pw:
     browser = pw.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
     ctx = browser.new_context(viewport={"width": 1100, "height": 2000})
     page = ctx.new_page()
     done = False
-    for oi, (dx, dy) in enumerate(OFFSETS):
+    for oi, t in enumerate(TRANSFORMS):
         if done:
             break
-        todo = [n for n in names if f"{n}|{dx}|{dy}" not in raw]
-        print(f"--- offset {oi} ({dx},{dy}) : {len(todo)} patches", flush=True)
+        todo = [n for n in names if f"{n}|{t}|0" not in raw]
+        print(f"--- transform {oi} (t={t}) : {len(todo)} views", flush=True)
         for i, name in enumerate(todo, 1):
             if time.time() - START > BUDGET:
                 print("global budget reached, stopping early", flush=True)
                 done = True
                 break
-            dst = os.path.join(TMP, f"{i}_{dx}_{dy}.jpg")
+            dst = os.path.join(TMP, f"{i}_{t}.jpg")
             res = None
             for attempt in (1, 2):
                 try:
-                    make_patch(name, dx, dy, dst)
+                    make_transform(name, t, dst)
                     res = run_patch(page, dst)
                 except Exception as e:
                     print("  error:", type(e).__name__, str(e)[:160], flush=True)
@@ -250,21 +268,21 @@ with sync_playwright() as pw:
                     page.wait_for_timeout(2000)
                 except Exception:
                     pass
-            print(f"[o{oi} {i}/{len(todo)}] {name[:44]:44s} -> "
+            print(f"[t{oi} {i}/{len(todo)}] {name[:44]:44s} -> "
                   f"{'d10=%s' % res.get('d10') if res and 'd10' in res else res}", flush=True)
             if res:
-                raw[f"{name}|{dx}|{dy}"] = res
+                raw[f"{name}|{t}|0"] = res
                 json.dump(raw, open(RAW, "w"), indent=1)
     browser.close()
 
-print("patch results:", len(raw), "of", len(names) * len(OFFSETS), flush=True)
+print("view results:", len(raw), "of", len(names) * len(TRANSFORMS), flush=True)
 '''
 
 open("/kaggle/working/grai_worker.py", "w").write(WORKER)
 
 import subprocess, sys
 r = subprocess.run([sys.executable, "/kaggle/working/grai_worker.py"],
-                   capture_output=True, text=True, timeout=16200)
+                   capture_output=True, text=True, timeout=14200)
 print(r.stdout[-14000:])
 print("---- stderr ----")
 print(r.stderr[-1500:])
@@ -273,9 +291,9 @@ print("worker rc:", r.returncode)
 
 md("""## 4. Recover `b`, `c` and rebuild the cumulative curves
 
-`d10, d30, d60` are fitted jointly in log space. Curves are averaged over the patches of a photo and then
-over the photos of a sample. The centre-only estimate is also rebuilt, as a check against the single-patch
-run and to confirm the TTA actually moves the prediction.
+`d10, d30, d60` are fitted jointly in log space. Curves are averaged over the orientation views of a photo
+and then over the photos of a sample. The identity-only estimate is also rebuilt, as a check against the
+single-view run and to confirm that averaging actually moves the prediction.
 """)
 
 code("""import numpy as np
