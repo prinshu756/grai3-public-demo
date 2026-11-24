@@ -49,6 +49,10 @@ permutations; the eight 45-degree views resample the full-resolution JPEG bicubi
 LANCZOS resize, which is a far smaller kernel than the 0.24-0.33x downsample that follows. The central
 87 x 87 mm window lies well inside the rotated frame, so no black fill ever reaches the crop.
 
+The eight axis-aligned views are read from the previous run's published JSON
+(`data/grai3_d8_views.json` in the repository), so the notebook only drives the demo for the eight new
+views. If that file cannot be fetched, the notebook falls back to collecting all sixteen itself.
+
 *Why 16 and not 8.* Splitting the eight axis-aligned views into two halves of four showed that the halves
 still disagree by 0.02-0.16 pp on the cumulative curve (SE of the 8-view mean: 0.031 pp). That residual is
 pure view noise, and it is what the last 0.03 of public score is made of, so the view set is doubled here.
@@ -131,6 +135,20 @@ for k, v in sorted(groups.items()):
 json.dump({"photos": [os.path.basename(p) for p in photos], "info": info},
           open("/kaggle/working/manifest.json", "w"))
 print("wrote manifest")
+
+# The eight axis-aligned views were collected and published by the previous run.
+# Seeding them here means this run only has to collect the eight 45-degree views;
+# if the URL is unreachable the notebook falls back to collecting all sixteen.
+SEED_URL = ("https://raw.githubusercontent.com/prinshu756/grai3-public-demo/"
+            "main/data/grai3_d8_views.json")
+try:
+    import urllib.request
+    with urllib.request.urlopen(SEED_URL, timeout=90) as f:
+        seed = json.load(f)
+    json.dump(seed, open("/kaggle/working/grai3_tta_raw.json", "w"))
+    print("seeded", len(seed), "precomputed views from", SEED_URL)
+except Exception as e:
+    print("seed unavailable, collecting all 16 views:", type(e).__name__, str(e)[:120])
 """)
 
 md("""## 3. Drive the public GRAI3 demo over the orientation views
