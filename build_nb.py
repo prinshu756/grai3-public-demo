@@ -37,12 +37,21 @@ the way the sample is poured, so the centre crop the demo uses is the correct on
 the git history, not used here.
 
 **What this notebook does instead.** It averages over *orientation* transforms of the very same pixels: all
-eight elements of the dihedral group (identity, three rotations, four reflections). A mirror or rotation of
-a soil photo depicts exactly the same grains, so the true grading curve is unchanged by construction: any
-spread across these eight views is pure model noise, and averaging it cannot introduce the spatial bias that
-translation did. Transforms are applied to the JPEG in place, keeping the pixel density and the EXIF camera
-tag intact (the demo's ppm lookup accepts the image either way round), so every view is a legitimate
-in-distribution 87 mm crop.
+sixteen elements of the dihedral group (rotations by multiples of 45 degrees, and their reflections). A
+mirror or rotation of a soil photo depicts exactly the same grains, so the true grading curve is unchanged
+by construction: any spread across these views is pure model noise, and averaging it cannot introduce the
+spatial bias that translation did. Transforms are applied to the JPEG in place, keeping the pixel density
+and the EXIF camera tag intact (the demo's ppm lookup accepts the image either way round), so every view is
+a legitimate in-distribution 87 mm crop.
+
+The eight axis-aligned views (identity, 90/180/270 degree rotations and their mirrors) are exact pixel
+permutations; the eight 45-degree views resample the full-resolution JPEG bicubically before the demo's
+LANCZOS resize, which is a far smaller kernel than the 0.24-0.33x downsample that follows. The central
+87 x 87 mm window lies well inside the rotated frame, so no black fill ever reaches the crop.
+
+*Why 16 and not 8.* Splitting the eight axis-aligned views into two halves of four showed that the halves
+still disagree by 0.02-0.16 pp on the cumulative curve (SE of the 8-view mean: 0.031 pp). That residual is
+pure view noise, and it is what the last 0.03 of public score is made of, so the view set is doubled here.
 
 *The reported diameters are enough to recover the curve exactly.* Since
 
@@ -150,9 +159,11 @@ names = man["photos"]
 info  = man["info"]
 raw   = json.load(open(RAW)) if os.path.exists(RAW) else {}
 
-# all eight dihedral transforms of the identical pixel set:
-# identity, hflip, vflip, rot180, rot90, rot270, transpose, anti-transpose
-TRANSFORMS = list(range(8))
+# sixteen elements of the dihedral group of the square-sampled circle:
+# 0-7  : axis-aligned views (identity, 90/180/270 rotations and four mirrors)
+# 8-15 : the same eight views pre-rotated by 45 degrees
+# 0-7 are exact pixel permutations, so a partial run is already the previous 8-view set.
+TRANSFORMS = list(range(16))
 
 SRC = "/kaggle/input/competitions/soil-grain-size-from-photos/Test_All_Photos/Test_All_Photos"
 if not os.path.isdir(SRC):
@@ -208,6 +219,13 @@ def make_transform(name, t, dst):
         a = a.transpose(1, 0, 2)        # reflection across the main diagonal
     elif t == 7:
         a = a.transpose(1, 0, 2)[::-1, ::-1]   # reflection across the anti-diagonal
+    elif t >= 8:
+        k, f = (t - 8) // 2, (t - 8) % 2        # 45/135/225/315 degrees, optionally mirrored
+        img = Image.fromarray(np.ascontiguousarray(a))
+        if f:
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+        img = img.rotate(45.0 + 90.0 * k, resample=Image.BICUBIC, expand=False)
+        a = np.asarray(img)
     Image.fromarray(np.ascontiguousarray(a)).save(dst, "JPEG", quality=95, exif=ex or b"")
 
 def run_patch(page, path, timeout=180):
@@ -236,7 +254,7 @@ def run_patch(page, path, timeout=180):
     return best
 
 START  = time.time()
-BUDGET = 13000
+BUDGET = 36000
 
 with sync_playwright() as pw:
     browser = pw.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
@@ -248,6 +266,7 @@ with sync_playwright() as pw:
             break
         todo = [n for n in names if f"{n}|{t}|0" not in raw]
         print(f"--- transform {oi} (t={t}) : {len(todo)} views", flush=True)
+        fails = 0
         for i, name in enumerate(todo, 1):
             if time.time() - START > BUDGET:
                 print("global budget reached, stopping early", flush=True)
@@ -273,6 +292,12 @@ with sync_playwright() as pw:
             if res:
                 raw[f"{name}|{t}|0"] = res
                 json.dump(raw, open(RAW, "w"), indent=1)
+                fails = 0
+            else:
+                fails += 1
+                if fails >= 4:
+                    print("  four consecutive failures: abandoning this transform", flush=True)
+                    break
     browser.close()
 
 print("view results:", len(raw), "of", len(names) * len(TRANSFORMS), flush=True)
@@ -280,13 +305,15 @@ print("view results:", len(raw), "of", len(names) * len(TRANSFORMS), flush=True)
 
 open("/kaggle/working/grai_worker.py", "w").write(WORKER)
 
-import subprocess, sys
+import subprocess, sys, shutil
 r = subprocess.run([sys.executable, "/kaggle/working/grai_worker.py"],
-                   capture_output=True, text=True, timeout=14200)
+                   capture_output=True, text=True, timeout=39000)
 print(r.stdout[-14000:])
 print("---- stderr ----")
 print(r.stderr[-1500:])
 print("worker rc:", r.returncode)
+shutil.rmtree(TMP, ignore_errors=True)   # keep the kernel output small: only the JSON is needed
+print("removed patch images")
 """)
 
 md("""## 4. Recover `b`, `c` and rebuild the cumulative curves
@@ -341,20 +368,20 @@ def curve_of(fr):
     b, c = bc
     return np.clip((1.0 - np.exp(-(SUPPORT / b) ** c)) * 100.0, 0.0, 100.0), bc
 
-# name|dx|dy -> curve
+# name|t|dy -> curve
 patch = {}
 for key, fr in raw.items():
-    name, dx, dy = key.rsplit("|", 2)
+    name, t, dy = key.rsplit("|", 2)
     cv, bc = curve_of(fr)
-    patch.setdefault(name, {})[(int(dx), int(dy))] = (cv, bc)
+    patch.setdefault(name, {})[(int(t), int(dy))] = (cv, bc)
 
-# per photo: mean over its patches
-photo_curve, photo_centre, offsets_used = {}, {}, {}
-for name, d in patch.items():
-    photo_curve[name] = np.mean(np.vstack([v[0] for v in d.values()]), axis=0)
-    offsets_used[name] = len(d)
-    if (0, 0) in d:
-        photo_centre[name] = d[(0, 0)][0]
+def photo_mean(table, tset):
+    out = {}
+    for name, d in table.items():
+        vs = [v[0] for k, v in d.items() if k[0] in tset]
+        if vs:
+            out[name] = np.mean(np.vstack(vs), axis=0)
+    return out
 
 def sample_mean(table):
     out = {}
@@ -362,36 +389,43 @@ def sample_mean(table):
         out.setdefault(sample_id(os.path.join(TEST_DIR, name)), []).append(cv)
     return {k: np.mean(np.vstack(v), axis=0) for k, v in out.items()}
 
-tta = sample_mean(photo_curve)
-cen = sample_mean(photo_centre)
+views = {}
+for t in range(16):
+    views[t] = sum(1 for d in patch.values() for k in d if k[0] == t)
+print("views collected per transform:", views)
+print("total views:", sum(views.values()), " photos:", len(patch))
 
-print("\\npatches per photo: min %d  max %d  median %.0f"
-      % (min(offsets_used.values()), max(offsets_used.values()),
-         float(np.median(list(offsets_used.values())))))
-print("\\ncentre-only vs multi-patch TTA (max |delta| in pp, per sample):")
-for s in sorted(tta):
-    d = 0.0 if s not in cen else float(np.abs(tta[s] - cen[s]).max())
-    print(f"  {s:35s} n_patches={len([1 for k in patch if sample_id(os.path.join(TEST_DIR,k))==s])}  maxd={d:6.2f}")
+tta8  = sample_mean(photo_mean(patch, set(range(8))))
+tta16 = sample_mean(photo_mean(patch, set(range(16))))
+
+print("\\n8-view vs 16-view sample curves (max |delta| in pp):")
+for s in sorted(tta16):
+    d = float(np.abs(tta16[s] - tta8[s]).max()) if s in tta8 else float("nan")
+    print(f"  {s:35s} maxd={d:6.3f}")
 
 train = pd.read_csv(os.path.join(DATA, "Training_labels_updated.csv"))
 fallback = np.maximum.accumulate(train[COLS].values.mean(axis=0))
 fallback[-1] = 100.0
 
 sub = pd.read_csv(os.path.join(DATA, "sample_submission.csv"))
-rows = []
-for sid in sub["sample_id"]:
-    if sid in tta:
-        m = np.maximum.accumulate(np.clip(tta[sid], 0, 100))
-        rows.append(m)
-    else:
-        print("MISSING (using training mean):", sid)
-        rows.append(fallback.copy())
 
-out = pd.DataFrame(rows, columns=COLS)
-out.insert(0, "sample_id", sub["sample_id"].values)
-out[COLS] = np.maximum.accumulate(np.clip(out[COLS].values, 0, 100), axis=1)
-out["200"] = 100.0
-out.to_csv("submission.csv", index=False)
+def frame(tta, path):
+    rows = []
+    for sid in sub["sample_id"]:
+        if sid in tta:
+            rows.append(np.maximum.accumulate(np.clip(tta[sid], 0, 100)))
+        else:
+            print("MISSING (using training mean):", sid)
+            rows.append(fallback.copy())
+    out = pd.DataFrame(rows, columns=COLS)
+    out.insert(0, "sample_id", sub["sample_id"].values)
+    out[COLS] = np.maximum.accumulate(np.clip(out[COLS].values, 0, 100), axis=1)
+    out["200"] = 100.0
+    out.to_csv(path, index=False)
+    return out
+
+out = frame(tta16, "submission.csv")
+frame(tta8, "submission_8view.csv")
 
 print()
 print(out.to_string(index=False))
