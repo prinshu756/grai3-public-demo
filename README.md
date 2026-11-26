@@ -135,6 +135,18 @@ kaggle competitions submit -c soil-grain-size-from-photos -f out/submission.csv 
 
 Runtime is dominated by the 280 demo uploads (~3.5 h at ~43 s each).
 
+## Helper tools (`tools/`)
+
+Post-processing scripts that run locally (no browser, no model — pure computation on published demo output):
+
+| script | purpose |
+|---|---|
+| `tools/make_sub.py` | Rebuilds/validates the test submission from a published per-view JSON. Defaults to `data/grai3_d8_views.json` (reproduces the 10.03072 file exactly). Use `--raw=... --views=16` for the 16-view ring output, and `shift_db shift_dc` to apply a Weibull correction (`b *= e^shift_db`, `c *= e^shift_dc`). |
+| `tools/analyze_calib2.py` | Scores the demo against the 24 labelled training soils, fits Weibull shift / pure-scale / per-bin-bias corrections, and validates them by leave-one-soil-out and leave-one-camera-out. Reads `out_cal2/train_views.csv`. |
+| `tools/build_nb_cal2.py` | Generates the Kaggle calibration notebook (`grai3_calib2.ipynb`) that drives the demo headlessly over the 127 labelled training photos at a corrected pixel density and writes `train_views.csv`. CPU only; internet enabled; TPU not applicable. |
+| `tools/grai3_calib2.ipynb` | Generated calibration notebook. |
+| `tools/kernel-metadata-calib2.json` | Kernel metadata for the calibration kernel (CPU, internet enabled, public). |
+
 ## Why not train a model on the 24 labelled soils
 
 The labelled training photos are downsampled to ~1600 px (~5.5 px/mm), and the demo's own pipeline is
